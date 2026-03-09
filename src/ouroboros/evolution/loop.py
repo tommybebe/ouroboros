@@ -776,7 +776,11 @@ class EvolutionaryLoop:
                                 str(reflect_result.error),
                             )
                         )
-                        return Result.err(OuroborosError(f"Reflect failed after {max_reflect_attempts} attempts: {reflect_result.error}"))
+                        return Result.err(
+                            OuroborosError(
+                                f"Reflect failed after {max_reflect_attempts} attempts: {reflect_result.error}"
+                            )
+                        )
 
                 reflect_output = reflect_result.value
 

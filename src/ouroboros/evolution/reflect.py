@@ -248,7 +248,12 @@ Guidelines:
             stagnant_count = 0
             gens = lineage.generations
             for i in range(len(gens) - 1, 0, -1):
-                if OntologyDelta.compute(gens[i - 1].ontology_snapshot, gens[i].ontology_snapshot).similarity >= 0.99:
+                if (
+                    OntologyDelta.compute(
+                        gens[i - 1].ontology_snapshot, gens[i].ontology_snapshot
+                    ).similarity
+                    >= 0.99
+                ):
                     stagnant_count += 1
                 else:
                     break
