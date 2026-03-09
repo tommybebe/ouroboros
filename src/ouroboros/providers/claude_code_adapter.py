@@ -241,7 +241,9 @@ class ClaudeCodeAdapter:
 
         for attempt in range(_MAX_RETRIES):
             try:
-                result = await self._execute_single_request(prompt, config, system_prompt=system_prompt)
+                result = await self._execute_single_request(
+                    prompt, config, system_prompt=system_prompt
+                )
 
                 if result.is_ok:
                     if attempt > 0:
