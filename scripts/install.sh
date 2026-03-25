@@ -210,10 +210,11 @@ with open(mcp_file, 'w') as f:
     echo "  MCP: skipped (no python3 found — add manually to $MCP_FILE)"
   fi
 
-  # 5b. Install Ouroboros skills (claude plugin)
+  # 5b. Install/update Ouroboros skills (claude plugin)
   echo "  Installing Ouroboros skills..."
-  if claude plugin marketplace add Q00/ouroboros 2>/dev/null \
-     && claude plugin install ouroboros@ouroboros 2>/dev/null; then
+  claude plugin marketplace add Q00/ouroboros 2>/dev/null || true
+  claude plugin marketplace update ouroboros 2>/dev/null || true
+  if claude plugin install ouroboros@ouroboros 2>/dev/null; then
     echo "  Skills: installed"
   else
     echo "  Skills: skipped (install manually: claude plugin marketplace add Q00/ouroboros && claude plugin install ouroboros@ouroboros)"

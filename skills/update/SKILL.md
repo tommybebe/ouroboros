@@ -116,7 +116,8 @@ When the user invokes this skill:
 
    For Claude Code:
    ```bash
-   claude plugin update ouroboros@ouroboros
+   claude plugin marketplace update ouroboros 2>/dev/null || true
+   claude plugin install ouroboros@ouroboros
    ```
 
    For Codex CLI (re-install skills/rules to ~/.codex/):
