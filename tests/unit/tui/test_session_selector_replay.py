@@ -44,7 +44,9 @@ class TestLoadSessionsReplay:
         """A started+completed session should show status 'completed'."""
         mock_event_store.get_all_sessions = AsyncMock(
             return_value=[
-                _make_event("orchestrator.session.started", "sess-1", {"seed_goal": "Build API"}, 0),
+                _make_event(
+                    "orchestrator.session.started", "sess-1", {"seed_goal": "Build API"}, 0
+                ),
                 _make_event("orchestrator.session.completed", "sess-1", {"summary": "done"}, 60),
             ]
         )
@@ -119,7 +121,12 @@ class TestLoadSessionsReplay:
         mock_event_store.get_all_sessions = AsyncMock(
             return_value=[
                 _make_event("orchestrator.session.started", "sess-3", {}, 0),
-                _make_event("orchestrator.session.started", "sess-3", {"seed_goal": "Real goal", "execution_id": "exec-99"}, 5),
+                _make_event(
+                    "orchestrator.session.started",
+                    "sess-3",
+                    {"seed_goal": "Real goal", "execution_id": "exec-99"},
+                    5,
+                ),
             ]
         )
 

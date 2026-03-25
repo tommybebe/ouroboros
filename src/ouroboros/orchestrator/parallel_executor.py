@@ -195,6 +195,7 @@ def _get_available_memory_gb() -> float | None:
 # (ACExecutionOutcome, ACExecutionResult, ParallelExecutionStageResult,
 #  ParallelExecutionResult, StageExecutionOutcome are imported above.)
 
+
 def _normalize_command(command: str) -> str:
     """Normalize Bash commands for stable audit output."""
     return " ".join(command.split())
