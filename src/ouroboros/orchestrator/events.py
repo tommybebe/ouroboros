@@ -583,11 +583,50 @@ def create_execution_terminal_event(
     )
 
 
+def create_merge_resolution_warnings_event(
+    execution_id: str,
+    session_id: str,
+    level_number: int,
+    warnings: list[str],
+    resolutions_summary: list[dict[str, Any]],
+) -> BaseEvent:
+    """Create merge resolution warnings event.
+
+    Emitted when the merge-agent flags non-trivial conflict resolutions
+    during worktree branch merging. Warnings are injected into the next
+    level's context so downstream ACs or the evaluation pipeline can verify.
+
+    Args:
+        execution_id: Current execution ID.
+        session_id: Current session ID.
+        level_number: Level whose merge produced warnings.
+        warnings: Warning strings for next-level injection.
+        resolutions_summary: Serialized summaries of each MergeResolution.
+
+    Returns:
+        BaseEvent for merge resolution warnings.
+    """
+    return BaseEvent(
+        type="execution.merge.warnings_flagged",
+        aggregate_type="execution",
+        aggregate_id=execution_id,
+        data={
+            "session_id": session_id,
+            "level_number": level_number,
+            "warnings": warnings,
+            "warning_count": len(warnings),
+            "resolutions_summary": resolutions_summary,
+            "timestamp": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
 __all__ = [
     "create_ac_stall_detected_event",
     "create_drift_measured_event",
     "create_execution_terminal_event",
     "create_heartbeat_event",
+    "create_merge_resolution_warnings_event",
     "create_mcp_tools_loaded_event",
     "create_progress_event",
     "create_session_cancelled_event",

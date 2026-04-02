@@ -15,6 +15,7 @@ import pytest
 
 from ouroboros.orchestrator.adapter import AgentMessage, RuntimeHandle
 from ouroboros.orchestrator.coordinator import (
+    ConflictPredictionMetrics,
     CoordinatorReview,
     FileConflict,
     LevelCoordinator,
@@ -683,3 +684,478 @@ class TestBuildContextPromptWithReview:
         assert "Coordinator Review (Level 2)" in prompt
         assert "Coordinator Review (Level 1)" not in prompt
         assert "Watch out for X" in prompt
+
+
+# =============================================================================
+# ConflictPredictionMetrics Tests
+# =============================================================================
+
+
+class TestConflictPredictionMetrics:
+    """Tests for ConflictPredictionMetrics dataclass."""
+
+    def test_default_empty_metrics(self):
+        metrics = ConflictPredictionMetrics()
+        assert metrics.level_number == 0
+        assert metrics.predicted_overlap_files == frozenset()
+        assert metrics.actual_conflict_files == frozenset()
+        assert metrics.covered_conflicts == frozenset()
+        assert metrics.missed_conflicts == frozenset()
+        assert metrics.false_positive_files == frozenset()
+        assert metrics.prediction_was_active is False
+        assert metrics.isolation_was_applied is False
+
+    def test_prediction_covered_all_when_no_misses(self):
+        metrics = ConflictPredictionMetrics(
+            level_number=1,
+            predicted_overlap_files=frozenset(["a.py", "b.py"]),
+            actual_conflict_files=frozenset(["a.py"]),
+            covered_conflicts=frozenset(["a.py"]),
+            missed_conflicts=frozenset(),
+            false_positive_files=frozenset(["b.py"]),
+            prediction_was_active=True,
+        )
+        assert metrics.prediction_covered_all is True
+        assert metrics.safety_net_fired is False
+
+    def test_safety_net_fired_when_misses_exist(self):
+        metrics = ConflictPredictionMetrics(
+            level_number=2,
+            predicted_overlap_files=frozenset(["a.py"]),
+            actual_conflict_files=frozenset(["a.py", "c.py"]),
+            covered_conflicts=frozenset(["a.py"]),
+            missed_conflicts=frozenset(["c.py"]),
+            prediction_was_active=True,
+        )
+        assert metrics.prediction_covered_all is False
+        assert metrics.safety_net_fired is True
+
+    def test_to_metadata_serialization(self):
+        metrics = ConflictPredictionMetrics(
+            level_number=1,
+            predicted_overlap_files=frozenset(["a.py", "b.py"]),
+            actual_conflict_files=frozenset(["a.py"]),
+            covered_conflicts=frozenset(["a.py"]),
+            missed_conflicts=frozenset(),
+            false_positive_files=frozenset(["b.py"]),
+            prediction_was_active=True,
+            isolation_was_applied=True,
+        )
+        meta = metrics.to_metadata()
+        assert meta["level_number"] == 1
+        assert meta["predicted_overlap_count"] == 2
+        assert meta["actual_conflict_count"] == 1
+        assert meta["covered_count"] == 1
+        assert meta["missed_count"] == 0
+        assert meta["false_positive_count"] == 1
+        assert meta["prediction_was_active"] is True
+        assert meta["isolation_was_applied"] is True
+        assert meta["prediction_covered_all"] is True
+        assert meta["safety_net_fired"] is False
+        assert meta["missed_files"] == []
+
+    def test_to_metadata_with_missed_files(self):
+        metrics = ConflictPredictionMetrics(
+            level_number=3,
+            missed_conflicts=frozenset(["x.py", "a.py"]),
+        )
+        meta = metrics.to_metadata()
+        assert meta["missed_files"] == ["a.py", "x.py"]  # sorted
+
+
+# =============================================================================
+# build_prediction_metrics Tests
+# =============================================================================
+
+
+class TestBuildPredictionMetrics:
+    """Tests for LevelCoordinator.build_prediction_metrics()."""
+
+    def test_no_prediction_no_conflicts(self):
+        metrics = LevelCoordinator.build_prediction_metrics(
+            level_number=1,
+            prediction=None,
+            conflicts=[],
+        )
+        assert metrics.prediction_was_active is False
+        assert metrics.prediction_covered_all is True  # no conflicts to miss
+        assert metrics.safety_net_fired is False
+
+    def test_no_prediction_with_conflicts(self):
+        """When prediction is None, all conflicts are 'missed'."""
+        conflicts = [
+            FileConflict(file_path="a.py", ac_indices=(0, 1)),
+            FileConflict(file_path="b.py", ac_indices=(0, 2)),
+        ]
+        metrics = LevelCoordinator.build_prediction_metrics(
+            level_number=1,
+            prediction=None,
+            conflicts=conflicts,
+        )
+        assert metrics.prediction_was_active is False
+        assert metrics.missed_conflicts == frozenset(["a.py", "b.py"])
+        assert metrics.safety_net_fired is True
+
+    def test_prediction_covers_all_conflicts(self):
+        """Prediction covered every actual conflict — no safety net needed."""
+        from ouroboros.orchestrator.file_overlap_predictor import (
+            ACFilePrediction,
+            FileOverlapPrediction,
+            OverlapGroup,
+        )
+
+        prediction = FileOverlapPrediction(
+            ac_predictions=(
+                ACFilePrediction(ac_index=0, predicted_paths=frozenset(["a.py", "b.py"])),
+                ACFilePrediction(ac_index=1, predicted_paths=frozenset(["a.py", "c.py"])),
+            ),
+            overlap_groups=(
+                OverlapGroup(ac_indices=(0, 1), shared_paths=frozenset(["a.py"])),
+            ),
+            isolated_ac_indices=frozenset({0, 1}),
+            shared_ac_indices=frozenset(),
+        )
+        conflicts = [FileConflict(file_path="a.py", ac_indices=(0, 1))]
+
+        metrics = LevelCoordinator.build_prediction_metrics(
+            level_number=1,
+            prediction=prediction,
+            conflicts=conflicts,
+            isolation_was_applied=True,
+        )
+        assert metrics.prediction_was_active is True
+        assert metrics.covered_conflicts == frozenset(["a.py"])
+        assert metrics.missed_conflicts == frozenset()
+        assert metrics.prediction_covered_all is True
+        assert metrics.safety_net_fired is False
+        assert metrics.isolation_was_applied is True
+
+    def test_prediction_misses_some_conflicts(self):
+        """Prediction missed a conflict — safety net fires."""
+        from ouroboros.orchestrator.file_overlap_predictor import (
+            ACFilePrediction,
+            FileOverlapPrediction,
+            OverlapGroup,
+        )
+
+        prediction = FileOverlapPrediction(
+            ac_predictions=(
+                ACFilePrediction(ac_index=0, predicted_paths=frozenset(["a.py"])),
+                ACFilePrediction(ac_index=1, predicted_paths=frozenset(["a.py"])),
+            ),
+            overlap_groups=(
+                OverlapGroup(ac_indices=(0, 1), shared_paths=frozenset(["a.py"])),
+            ),
+            isolated_ac_indices=frozenset({0, 1}),
+            shared_ac_indices=frozenset(),
+        )
+        # a.py was predicted, but b.py was not
+        conflicts = [
+            FileConflict(file_path="a.py", ac_indices=(0, 1)),
+            FileConflict(file_path="b.py", ac_indices=(0, 1)),
+        ]
+
+        metrics = LevelCoordinator.build_prediction_metrics(
+            level_number=2,
+            prediction=prediction,
+            conflicts=conflicts,
+        )
+        assert metrics.prediction_was_active is True
+        assert metrics.covered_conflicts == frozenset(["a.py"])
+        assert metrics.missed_conflicts == frozenset(["b.py"])
+        assert metrics.safety_net_fired is True
+
+    def test_false_positives_tracked(self):
+        """Predicted overlaps that didn't become actual conflicts."""
+        from ouroboros.orchestrator.file_overlap_predictor import (
+            ACFilePrediction,
+            FileOverlapPrediction,
+            OverlapGroup,
+        )
+
+        prediction = FileOverlapPrediction(
+            ac_predictions=(
+                ACFilePrediction(ac_index=0, predicted_paths=frozenset(["a.py", "b.py", "c.py"])),
+                ACFilePrediction(ac_index=1, predicted_paths=frozenset(["a.py", "b.py", "c.py"])),
+            ),
+            overlap_groups=(
+                OverlapGroup(
+                    ac_indices=(0, 1),
+                    shared_paths=frozenset(["a.py", "b.py", "c.py"]),
+                ),
+            ),
+            isolated_ac_indices=frozenset({0, 1}),
+            shared_ac_indices=frozenset(),
+        )
+        # Only a.py had an actual conflict
+        conflicts = [FileConflict(file_path="a.py", ac_indices=(0, 1))]
+
+        metrics = LevelCoordinator.build_prediction_metrics(
+            level_number=1,
+            prediction=prediction,
+            conflicts=conflicts,
+        )
+        assert metrics.false_positive_files == frozenset(["b.py", "c.py"])
+        assert metrics.prediction_covered_all is True
+
+    def test_prediction_no_overlaps_no_conflicts(self):
+        """Clean run: prediction found no overlaps, no conflicts occurred."""
+        from ouroboros.orchestrator.file_overlap_predictor import (
+            ACFilePrediction,
+            FileOverlapPrediction,
+        )
+
+        prediction = FileOverlapPrediction(
+            ac_predictions=(
+                ACFilePrediction(ac_index=0, predicted_paths=frozenset(["a.py"])),
+                ACFilePrediction(ac_index=1, predicted_paths=frozenset(["b.py"])),
+            ),
+            overlap_groups=(),
+            isolated_ac_indices=frozenset(),
+            shared_ac_indices=frozenset({0, 1}),
+        )
+
+        metrics = LevelCoordinator.build_prediction_metrics(
+            level_number=1,
+            prediction=prediction,
+            conflicts=[],
+        )
+        assert metrics.prediction_was_active is True
+        assert metrics.prediction_covered_all is True
+        assert metrics.safety_net_fired is False
+        assert metrics.false_positive_files == frozenset()
+
+
+# =============================================================================
+# Safety Net Fallback Integration Tests
+# =============================================================================
+
+
+class TestCoordinatorSafetyNetFallback:
+    """Verify coordinator post-hoc detection remains as fallback for rare false negatives.
+
+    The proactive file overlap prediction engine runs before execution and isolates
+    ACs into worktrees when overlap is predicted. However, prediction can have rare
+    false negatives. The coordinator's detect_file_conflicts() always runs after
+    execution — it is the safety net that catches anything prediction missed.
+
+    These tests validate the full fallback chain:
+    1. Prediction runs but misses some file overlaps
+    2. Coordinator post-hoc detection catches the missed conflicts
+    3. Metrics correctly reflect safety_net_fired=True
+    4. Review is triggered for the missed conflicts
+    """
+
+    def test_safety_net_catches_unpredicted_conflict(self):
+        """Coordinator detects a conflict that prediction did not flag."""
+        # AC 0 and AC 1 both edited shared.py, but prediction only flagged config.py
+        results = [
+            _make_result(0, [("Edit", "src/shared.py"), ("Edit", "src/config.py")]),
+            _make_result(1, [("Edit", "src/shared.py"), ("Write", "src/other.py")]),
+        ]
+
+        # Post-hoc detection catches it
+        conflicts = LevelCoordinator.detect_file_conflicts(results)
+        assert len(conflicts) == 1
+        assert conflicts[0].file_path == "src/shared.py"
+        assert conflicts[0].ac_indices == (0, 1)
+
+    def test_safety_net_fires_when_prediction_misses_file(self):
+        """Prediction covered some overlaps but missed one — safety net fires."""
+        from ouroboros.orchestrator.file_overlap_predictor import (
+            ACFilePrediction,
+            FileOverlapPrediction,
+            OverlapGroup,
+        )
+
+        # Prediction flagged config.py as overlapping, but missed shared.py
+        prediction = FileOverlapPrediction(
+            ac_predictions=(
+                ACFilePrediction(
+                    ac_index=0,
+                    predicted_paths=frozenset(["src/config.py", "src/a.py"]),
+                ),
+                ACFilePrediction(
+                    ac_index=1,
+                    predicted_paths=frozenset(["src/config.py", "src/b.py"]),
+                ),
+            ),
+            overlap_groups=(
+                OverlapGroup(
+                    ac_indices=(0, 1),
+                    shared_paths=frozenset(["src/config.py"]),
+                ),
+            ),
+            isolated_ac_indices=frozenset({0, 1}),
+            shared_ac_indices=frozenset(),
+        )
+
+        # Actual conflicts: config.py (predicted) and shared.py (missed)
+        actual_conflicts = [
+            FileConflict(file_path="src/config.py", ac_indices=(0, 1)),
+            FileConflict(file_path="src/shared.py", ac_indices=(0, 1)),
+        ]
+
+        metrics = LevelCoordinator.build_prediction_metrics(
+            level_number=1,
+            prediction=prediction,
+            conflicts=actual_conflicts,
+            isolation_was_applied=True,
+        )
+
+        assert metrics.safety_net_fired is True
+        assert metrics.missed_conflicts == frozenset(["src/shared.py"])
+        assert metrics.covered_conflicts == frozenset(["src/config.py"])
+        assert metrics.prediction_was_active is True
+        assert metrics.isolation_was_applied is True
+
+    def test_safety_net_does_not_fire_when_prediction_covers_all(self):
+        """When prediction covers all actual conflicts, safety net stays silent."""
+        from ouroboros.orchestrator.file_overlap_predictor import (
+            ACFilePrediction,
+            FileOverlapPrediction,
+            OverlapGroup,
+        )
+
+        prediction = FileOverlapPrediction(
+            ac_predictions=(
+                ACFilePrediction(
+                    ac_index=0,
+                    predicted_paths=frozenset(["src/shared.py", "src/config.py"]),
+                ),
+                ACFilePrediction(
+                    ac_index=1,
+                    predicted_paths=frozenset(["src/shared.py", "src/config.py"]),
+                ),
+            ),
+            overlap_groups=(
+                OverlapGroup(
+                    ac_indices=(0, 1),
+                    shared_paths=frozenset(["src/shared.py", "src/config.py"]),
+                ),
+            ),
+            isolated_ac_indices=frozenset({0, 1}),
+            shared_ac_indices=frozenset(),
+        )
+
+        actual_conflicts = [
+            FileConflict(file_path="src/shared.py", ac_indices=(0, 1)),
+        ]
+
+        metrics = LevelCoordinator.build_prediction_metrics(
+            level_number=1,
+            prediction=prediction,
+            conflicts=actual_conflicts,
+            isolation_was_applied=True,
+        )
+
+        assert metrics.safety_net_fired is False
+        assert metrics.prediction_covered_all is True
+        assert metrics.covered_conflicts == frozenset(["src/shared.py"])
+        assert metrics.false_positive_files == frozenset(["src/config.py"])
+
+    def test_detect_file_conflicts_always_runs_regardless_of_prediction(self):
+        """detect_file_conflicts is a static method with no prediction awareness.
+
+        This verifies the architectural property: post-hoc detection is completely
+        independent of pre-execution prediction. It always scans actual tool call
+        messages, ensuring it catches conflicts regardless of prediction state.
+        """
+        # Scenario: even when ACs ran in worktrees, if both touched the same file
+        # the coordinator detects it from the merged result messages
+        results = [
+            _make_result(0, [("Write", "src/api.py"), ("Edit", "src/models.py")]),
+            _make_result(1, [("Edit", "src/models.py")]),
+            _make_result(2, [("Write", "src/views.py")]),
+        ]
+
+        conflicts = LevelCoordinator.detect_file_conflicts(results)
+
+        # Only models.py is a conflict (touched by AC 0 and AC 1)
+        assert len(conflicts) == 1
+        assert conflicts[0].file_path == "src/models.py"
+        assert conflicts[0].ac_indices == (0, 1)
+
+    def test_safety_net_metrics_serialization_includes_missed_files(self):
+        """Missed files are included in serialized metadata for observability."""
+        metrics = ConflictPredictionMetrics(
+            level_number=2,
+            predicted_overlap_files=frozenset(["a.py"]),
+            actual_conflict_files=frozenset(["a.py", "missed.py", "also_missed.py"]),
+            covered_conflicts=frozenset(["a.py"]),
+            missed_conflicts=frozenset(["missed.py", "also_missed.py"]),
+            false_positive_files=frozenset(),
+            prediction_was_active=True,
+            isolation_was_applied=True,
+        )
+
+        meta = metrics.to_metadata()
+        assert meta["safety_net_fired"] is True
+        assert meta["missed_count"] == 2
+        assert meta["missed_files"] == ["also_missed.py", "missed.py"]  # sorted
+        assert meta["prediction_covered_all"] is False
+
+    @pytest.mark.asyncio
+    async def test_review_triggered_for_missed_conflicts(self):
+        """When safety net detects missed conflicts, run_review resolves them."""
+        review_response = (
+            '{"review_summary": "Resolved missed conflict in shared.py",'
+            ' "fixes_applied": ["Merged overlapping edits"],'
+            ' "warnings_for_next_level": ["Verify shared.py integration"],'
+            ' "conflicts_resolved": ["src/shared.py"]}'
+        )
+        runtime = _StubCoordinatorRuntime(
+            (
+                AgentMessage(
+                    type="assistant",
+                    content="Inspecting conflict",
+                    resume_handle=RuntimeHandle(
+                        backend="opencode",
+                        kind="level_coordinator",
+                        native_session_id="safety-net-review-1",
+                        cwd="/tmp/project",
+                        approval_mode="acceptEdits",
+                        metadata={},
+                    ),
+                ),
+                AgentMessage(
+                    type="result",
+                    content=review_response,
+                    data={"subtype": "success"},
+                    resume_handle=RuntimeHandle(
+                        backend="opencode",
+                        kind="level_coordinator",
+                        native_session_id="safety-net-review-1",
+                        cwd="/tmp/project",
+                        approval_mode="acceptEdits",
+                        metadata={},
+                    ),
+                ),
+            )
+        )
+        coordinator = LevelCoordinator(runtime)
+        level_ctx = LevelContext(
+            level_number=1,
+            completed_acs=(
+                ACContextSummary(ac_index=0, ac_content="AC 1", success=True),
+                ACContextSummary(ac_index=1, ac_content="AC 2", success=True),
+            ),
+        )
+
+        # Conflicts detected by safety net (prediction missed src/shared.py)
+        missed_conflicts = [
+            FileConflict(file_path="src/shared.py", ac_indices=(0, 1)),
+        ]
+
+        review = await coordinator.run_review(
+            execution_id="exec_safety_net",
+            conflicts=missed_conflicts,
+            level_context=level_ctx,
+            level_number=1,
+        )
+
+        assert review.review_summary == "Resolved missed conflict in shared.py"
+        assert review.fixes_applied == ("Merged overlapping edits",)
+        assert review.warnings_for_next_level == ("Verify shared.py integration",)
+        assert review.conflicts_detected[0].resolved is True
+        assert review.session_id == "safety-net-review-1"

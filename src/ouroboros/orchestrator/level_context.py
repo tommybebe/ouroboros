@@ -60,11 +60,17 @@ class LevelContext:
         level_number: 0-based execution level index.
         completed_acs: Summaries of ACs in this level.
         coordinator_review: Optional review from the Level Coordinator.
+        merge_warnings: Warnings from merge-agent conflict resolutions.
+            Populated when worktree isolation detected overlapping changes
+            and the merge-agent resolved them with non-trivial decisions.
+            These are injected into subsequent level prompts so downstream
+            ACs or the evaluation pipeline can verify correctness.
     """
 
     level_number: int
     completed_acs: tuple[ACContextSummary, ...] = field(default_factory=tuple)
     coordinator_review: CoordinatorReview | None = None
+    merge_warnings: tuple[str, ...] = field(default_factory=tuple)
 
     def to_prompt_text(self) -> str:
         """Format context as prompt text for injection into next level.
@@ -114,7 +120,8 @@ def build_context_prompt(level_contexts: list[LevelContext]) -> str:
             sections.append(text)
 
     has_reviews = any(ctx.coordinator_review for ctx in level_contexts)
-    if not sections and not has_reviews:
+    has_merge_warnings = any(ctx.merge_warnings for ctx in level_contexts)
+    if not sections and not has_reviews and not has_merge_warnings:
         return ""
 
     result = ""
@@ -148,6 +155,20 @@ def build_context_prompt(level_contexts: list[LevelContext]) -> str:
                     + "\n".join(review_lines)
                     + "\n"
                 )
+
+    # Append merge-agent warnings if present
+    for ctx in level_contexts:
+        if ctx.merge_warnings:
+            warning_lines: list[str] = []
+            for warning in ctx.merge_warnings:
+                warning_lines.append(f"- ⚠ {warning}")
+            result += (
+                f"\n## Merge Resolution Warnings (Level {ctx.level_number})\n"
+                "The following warnings were flagged during merge of parallel "
+                "AC worktree branches. Verify these resolutions are correct.\n\n"
+                + "\n".join(warning_lines)
+                + "\n"
+            )
 
     return result
 
@@ -287,6 +308,7 @@ def deserialize_level_contexts(data: list[dict[str, Any]]) -> list[LevelContext]
                 level_number=d.get("level_number", 0),
                 completed_acs=tuple(completed_acs),
                 coordinator_review=review,
+                merge_warnings=tuple(d.get("merge_warnings", ())),
             )
         )
     return result
