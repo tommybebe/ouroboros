@@ -39,6 +39,7 @@ from ouroboros.orchestrator.execution_runtime_scope import (
 
 if TYPE_CHECKING:
     from ouroboros.orchestrator.adapter import AgentMessage, AgentRuntime
+    from ouroboros.orchestrator.file_overlap_predictor import FileOverlapPrediction
     from ouroboros.orchestrator.level_context import LevelContext
     from ouroboros.orchestrator.parallel_executor import ACExecutionResult
 
@@ -169,6 +170,68 @@ class CoordinatorReview:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ConflictPredictionMetrics:
+    """Tracks prediction accuracy for a single level's conflict detection.
+
+    Compares the prediction engine's pre-execution file overlap predictions
+    against the coordinator's post-hoc conflict detection to measure
+    prediction quality. Conservative prediction means ``missed_conflicts``
+    should always be zero.
+
+    Attributes:
+        level_number: Which level these metrics apply to.
+        predicted_overlap_files: Files that the prediction engine flagged
+            as potential overlaps before execution.
+        actual_conflict_files: Files that the coordinator detected as
+            actual conflicts post-execution.
+        covered_conflicts: Actual conflicts that were covered by prediction
+            (intersection of predicted and actual).
+        missed_conflicts: Actual conflicts NOT covered by prediction —
+            indicates a false negative in the prediction engine.
+        false_positive_files: Predicted overlaps that did not become actual
+            conflicts — expected in conservative prediction.
+        prediction_was_active: Whether prediction was run for this level.
+        isolation_was_applied: Whether worktree isolation was actually applied
+            for any AC in this level.
+    """
+
+    level_number: int = 0
+    predicted_overlap_files: frozenset[str] = field(default_factory=frozenset)
+    actual_conflict_files: frozenset[str] = field(default_factory=frozenset)
+    covered_conflicts: frozenset[str] = field(default_factory=frozenset)
+    missed_conflicts: frozenset[str] = field(default_factory=frozenset)
+    false_positive_files: frozenset[str] = field(default_factory=frozenset)
+    prediction_was_active: bool = False
+    isolation_was_applied: bool = False
+
+    @property
+    def prediction_covered_all(self) -> bool:
+        """True when prediction caught every actual conflict (zero misses)."""
+        return len(self.missed_conflicts) == 0
+
+    @property
+    def safety_net_fired(self) -> bool:
+        """True when post-hoc coordinator detected conflicts not covered by prediction."""
+        return len(self.missed_conflicts) > 0
+
+    def to_metadata(self) -> dict[str, Any]:
+        """Serialize for event/checkpoint storage."""
+        return {
+            "level_number": self.level_number,
+            "predicted_overlap_count": len(self.predicted_overlap_files),
+            "actual_conflict_count": len(self.actual_conflict_files),
+            "covered_count": len(self.covered_conflicts),
+            "missed_count": len(self.missed_conflicts),
+            "false_positive_count": len(self.false_positive_files),
+            "prediction_was_active": self.prediction_was_active,
+            "isolation_was_applied": self.isolation_was_applied,
+            "prediction_covered_all": self.prediction_covered_all,
+            "safety_net_fired": self.safety_net_fired,
+            "missed_files": sorted(self.missed_conflicts) if self.missed_conflicts else [],
+        }
+
+
 class LevelCoordinator:
     """Coordinates between parallel execution levels.
 
@@ -276,6 +339,143 @@ class LevelCoordinator:
         if runtime_handle is None:
             return
         self._level_runtime_handles[(execution_id, level_number)] = runtime_handle
+
+    async def run_pre_execution_prediction(
+        self,
+        ac_specs: Any,
+        *,
+        seed: Any | None = None,
+        stage_ac_indices: tuple[int, ...] | None = None,
+        repo_root: str | None = None,
+    ) -> FileOverlapPrediction | None:
+        """Run the file overlap prediction engine before AC execution.
+
+        This is the pre-execution phase: predict which files each AC will
+        touch and identify overlap groups. The prediction result drives
+        downstream isolation decisions (worktree vs shared workspace).
+
+        Returns None if prediction cannot be run (e.g. no AC specs).
+
+        Args:
+            ac_specs: AC dependency specs for the current stage.
+            seed: Optional seed for brownfield context integration.
+            stage_ac_indices: AC indices in this stage.
+            repo_root: Repository root for filesystem discovery.
+
+        Returns:
+            FileOverlapPrediction or None if prediction was skipped.
+        """
+        from ouroboros.orchestrator.file_overlap_predictor import predict_file_overlaps
+
+        if not ac_specs:
+            return None
+
+        try:
+            prediction = await predict_file_overlaps(
+                ac_specs,
+                repo_root=repo_root,
+                seed=seed,
+                stage_ac_indices=stage_ac_indices,
+            )
+            log.info(
+                "coordinator.prediction.completed",
+                has_overlaps=prediction.has_overlaps,
+                overlap_groups=len(prediction.overlap_groups),
+                isolated_count=len(prediction.isolated_ac_indices),
+                shared_count=len(prediction.shared_ac_indices),
+            )
+            return prediction
+        except Exception as exc:
+            log.warning(
+                "coordinator.prediction.failed",
+                error=str(exc),
+            )
+            return None
+
+    @staticmethod
+    def build_prediction_metrics(
+        level_number: int,
+        prediction: FileOverlapPrediction | None,
+        conflicts: list[FileConflict],
+        *,
+        isolation_was_applied: bool = False,
+    ) -> ConflictPredictionMetrics:
+        """Compare prediction results against actual post-hoc conflicts.
+
+        Builds metrics that track whether the prediction engine covered
+        all actual file conflicts, or whether the coordinator safety net
+        had to catch conflicts that prediction missed.
+
+        Args:
+            level_number: Which level these metrics apply to.
+            prediction: Pre-execution prediction result (None if skipped).
+            conflicts: Post-hoc detected file conflicts.
+            isolation_was_applied: Whether worktree isolation was used.
+
+        Returns:
+            ConflictPredictionMetrics with coverage analysis.
+        """
+        actual_conflict_files = frozenset(c.file_path for c in conflicts)
+
+        if prediction is None:
+            # No prediction was run — all conflicts are "missed" by definition
+            return ConflictPredictionMetrics(
+                level_number=level_number,
+                actual_conflict_files=actual_conflict_files,
+                missed_conflicts=actual_conflict_files,
+                prediction_was_active=False,
+                isolation_was_applied=isolation_was_applied,
+            )
+
+        # Collect all files that prediction flagged as overlapping
+        predicted_files: set[str] = set()
+        for group in prediction.overlap_groups:
+            predicted_files.update(group.shared_paths)
+
+        predicted_overlap_files = frozenset(predicted_files)
+        covered = actual_conflict_files & predicted_overlap_files
+        missed = actual_conflict_files - predicted_overlap_files
+        false_positives = predicted_overlap_files - actual_conflict_files
+
+        metrics = ConflictPredictionMetrics(
+            level_number=level_number,
+            predicted_overlap_files=predicted_overlap_files,
+            actual_conflict_files=actual_conflict_files,
+            covered_conflicts=covered,
+            missed_conflicts=missed,
+            false_positive_files=false_positives,
+            prediction_was_active=True,
+            isolation_was_applied=isolation_was_applied,
+        )
+
+        # Log prediction accuracy
+        if missed:
+            log.warning(
+                "coordinator.prediction_metrics.missed_conflicts",
+                level=level_number,
+                missed_count=len(missed),
+                missed_files=sorted(missed),
+                covered_count=len(covered),
+                predicted_count=len(predicted_overlap_files),
+                actual_count=len(actual_conflict_files),
+            )
+        elif actual_conflict_files:
+            log.info(
+                "coordinator.prediction_metrics.all_covered",
+                level=level_number,
+                covered_count=len(covered),
+                false_positive_count=len(false_positives),
+                isolation_was_applied=isolation_was_applied,
+            )
+        else:
+            log.debug(
+                "coordinator.prediction_metrics.no_conflicts",
+                level=level_number,
+                predicted_overlap_count=len(predicted_overlap_files),
+                false_positive_count=len(false_positives),
+            )
+
+        return metrics
 
     @staticmethod
     def detect_file_conflicts(
@@ -594,8 +794,9 @@ def _parse_review_response(
 
 
 __all__ = [
+    "COORDINATOR_TOOLS",
+    "ConflictPredictionMetrics",
     "CoordinatorReview",
     "FileConflict",
     "LevelCoordinator",
-    "COORDINATOR_TOOLS",
 ]

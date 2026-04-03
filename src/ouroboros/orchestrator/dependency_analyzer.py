@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 import json
+from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -14,6 +15,8 @@ from ouroboros.core.types import Result
 from ouroboros.observability.logging import get_logger
 
 if TYPE_CHECKING:
+    from ouroboros.core.seed import Seed
+    from ouroboros.orchestrator.file_overlap_predictor import FileOverlapPrediction
     from ouroboros.providers.base import LLMAdapter
 
 log = get_logger(__name__)
@@ -136,10 +139,19 @@ class ExecutionStage:
 
 @dataclass(frozen=True, slots=True)
 class StagedExecutionPlan:
-    """Normalized execution plan consumed by the runtime executor."""
+    """Normalized execution plan consumed by the runtime executor.
+
+    When ``file_overlap_predictions`` is populated, each entry maps a stage
+    index to the :class:`FileOverlapPrediction` produced at planning time.
+    The runtime executor can use these predictions directly to classify
+    isolation modes instead of running a separate prediction phase.
+    """
 
     nodes: tuple[ACNode, ...]
     stages: tuple[ExecutionStage, ...] = field(default_factory=tuple)
+    file_overlap_predictions: dict[int, FileOverlapPrediction] = field(
+        default_factory=dict,
+    )
 
     @property
     def total_stages(self) -> int:
@@ -170,13 +182,36 @@ class StagedExecutionPlan:
                 return stage
         return None
 
+    def get_stage_prediction(self, stage_index: int) -> FileOverlapPrediction | None:
+        """Return the file overlap prediction for a specific stage, if available.
+
+        Returns None when:
+        - No prediction was run at planning time.
+        - The stage is single-AC (prediction was skipped).
+        - The stage index is not found.
+        """
+        return self.file_overlap_predictions.get(stage_index)
+
+    @property
+    def has_file_overlap_predictions(self) -> bool:
+        """True when at least one stage has a file overlap prediction."""
+        return bool(self.file_overlap_predictions)
+
 
 @dataclass(frozen=True, slots=True)
 class DependencyGraph:
-    """Dependency graph for AC execution."""
+    """Dependency graph for AC execution.
+
+    When ``file_overlap_prediction`` is set, it contains the planning-time
+    file overlap prediction covering all ACs in the graph.  The graph's
+    ``to_execution_plan()`` / ``to_runtime_execution_plan()`` methods
+    propagate this prediction into the resulting
+    :class:`StagedExecutionPlan` on a per-stage basis.
+    """
 
     nodes: tuple[ACNode, ...]
     execution_levels: tuple[tuple[int, ...], ...] = field(default_factory=tuple)
+    file_overlap_prediction: FileOverlapPrediction | None = None
 
     @property
     def total_levels(self) -> int:
@@ -334,7 +369,63 @@ class HybridExecutionPlanner:
                 )
             )
 
-        return StagedExecutionPlan(nodes=dependency_graph.nodes, stages=tuple(stages))
+        # Propagate file overlap prediction from the graph into per-stage
+        # predictions.  When the graph carries a planning-time prediction, we
+        # slice it per parallel stage so the executor can look up isolation
+        # decisions by stage index without re-running prediction.
+        stage_predictions: dict[int, FileOverlapPrediction] = {}
+        graph_prediction = dependency_graph.file_overlap_prediction
+        if graph_prediction is not None:
+            from ouroboros.orchestrator.file_overlap_predictor import (
+                FileOverlapPrediction,
+                OverlapGroup,
+            )
+
+            for stage in stages:
+                if not stage.is_parallel:
+                    continue
+                stage_indices = frozenset(stage.ac_indices)
+
+                # Filter AC predictions to this stage's ACs
+                stage_ac_preds = [
+                    p for p in graph_prediction.ac_predictions
+                    if p.ac_index in stage_indices
+                ]
+                if not stage_ac_preds:
+                    continue
+
+                # Filter overlap groups to those relevant to this stage
+                stage_groups: list[OverlapGroup] = []
+                for group in graph_prediction.overlap_groups:
+                    # Keep the group if at least two of its ACs are in this stage
+                    stage_members = tuple(
+                        idx for idx in group.ac_indices if idx in stage_indices
+                    )
+                    if len(stage_members) >= 2:
+                        stage_groups.append(
+                            OverlapGroup(
+                                ac_indices=stage_members,
+                                shared_paths=group.shared_paths,
+                            )
+                        )
+
+                isolated = frozenset(
+                    idx for g in stage_groups for idx in g.ac_indices
+                )
+                shared = stage_indices - isolated
+
+                stage_predictions[stage.index] = FileOverlapPrediction(
+                    ac_predictions=tuple(stage_ac_preds),
+                    overlap_groups=tuple(stage_groups),
+                    isolated_ac_indices=isolated,
+                    shared_ac_indices=shared,
+                )
+
+        return StagedExecutionPlan(
+            nodes=dependency_graph.nodes,
+            stages=tuple(stages),
+            file_overlap_predictions=stage_predictions,
+        )
 
 
 class DependencyAnalyzer:
@@ -399,6 +490,122 @@ class DependencyAnalyzer:
         )
 
         return Result.ok(graph)
+
+    async def analyze_with_file_overlap(
+        self,
+        acceptance_criteria: Sequence[str] | Sequence[ACDependencySpec],
+        *,
+        repo_root: str | Path | None = None,
+        seed: Seed | None = None,
+        file_index: frozenset[str] | None = None,
+    ) -> Result[DependencyGraph, DependencyAnalysisError]:
+        """Analyze AC dependencies **and** predict file overlaps at planning time.
+
+        This extends :meth:`analyze` with a file overlap prediction phase that
+        runs *before* execution begins.  The returned :class:`DependencyGraph`
+        carries a :attr:`~DependencyGraph.file_overlap_prediction` so the
+        runtime executor can derive per-stage isolation decisions without a
+        separate prediction pass.
+
+        Conservative prediction: the prediction is intentionally broad — it
+        over-predicts overlap rather than under-predicting — so the coordinator's
+        post-hoc detection acts as a safety net for the rare false-negative case.
+
+        When ``repo_root`` is ``None`` and no ``file_index`` is provided, the
+        file overlap prediction is skipped and the result is equivalent to
+        calling :meth:`analyze` directly.
+
+        Args:
+            acceptance_criteria: AC texts or structured specs.
+            repo_root: Repository root for filesystem discovery.
+            seed: Optional seed for brownfield context integration.
+            file_index: Pre-built set of known repo-relative file paths.
+
+        Returns:
+            Result containing a DependencyGraph with file_overlap_prediction
+            populated when prediction was feasible.
+        """
+        result = await self.analyze(acceptance_criteria)
+        if result.is_err:
+            return result
+
+        graph = result.value
+
+        # Only predict when there are parallel levels with 2+ ACs
+        parallel_levels = [
+            level for level in graph.execution_levels if len(level) > 1
+        ]
+        if not parallel_levels:
+            log.debug(
+                "dependency_analyzer.file_overlap.skipped",
+                reason="no_parallel_levels",
+            )
+            return result
+
+        # Run file overlap prediction across all ACs
+        specs = self._normalize_specs(acceptance_criteria)
+        prediction = await self._predict_file_overlaps(
+            specs,
+            repo_root=repo_root,
+            seed=seed,
+            file_index=file_index,
+        )
+
+        if prediction is None:
+            return result
+
+        # Attach prediction to the graph
+        graph_with_prediction = DependencyGraph(
+            nodes=graph.nodes,
+            execution_levels=graph.execution_levels,
+            file_overlap_prediction=prediction,
+        )
+
+        log.info(
+            "dependency_analyzer.file_overlap.completed",
+            has_overlaps=prediction.has_overlaps,
+            overlap_groups=len(prediction.overlap_groups),
+            isolated_count=len(prediction.isolated_ac_indices),
+            shared_count=len(prediction.shared_ac_indices),
+        )
+
+        return Result.ok(graph_with_prediction)
+
+    async def _predict_file_overlaps(
+        self,
+        specs: tuple[ACDependencySpec, ...],
+        *,
+        repo_root: str | Path | None = None,
+        seed: Seed | None = None,
+        file_index: frozenset[str] | None = None,
+    ) -> FileOverlapPrediction | None:
+        """Run the file overlap predictor on the given AC specs.
+
+        Returns None when prediction cannot be run (no repo root and no
+        file index provided).
+        """
+        if repo_root is None and file_index is None:
+            log.debug(
+                "dependency_analyzer.file_overlap.skipped",
+                reason="no_repo_root_or_file_index",
+            )
+            return None
+
+        from ouroboros.orchestrator.file_overlap_predictor import predict_file_overlaps
+
+        try:
+            return await predict_file_overlaps(
+                specs,
+                repo_root=repo_root,
+                seed=seed,
+                file_index=file_index,
+            )
+        except Exception as exc:
+            log.warning(
+                "dependency_analyzer.file_overlap.failed",
+                error=str(exc),
+            )
+            return None
 
     def _normalize_specs(
         self,

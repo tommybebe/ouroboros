@@ -40,13 +40,27 @@ from typing import TYPE_CHECKING, Any
 import anyio
 from rich.console import Console
 
+from ouroboros.core.worktree import WorktreeError, _try_resolve_repo_root
 from ouroboros.observability.logging import get_logger
+from ouroboros.orchestrator.ac_isolation import (
+    ACIsolationPlan,
+    IsolationMode,
+    classify_isolation_modes,
+    needs_worktree,
+)
+from ouroboros.orchestrator.ac_worktree import (
+    ACWorktreeInfo,
+    ACWorktreeManager,
+)
 from ouroboros.orchestrator.adapter import (
     AgentMessage,
     RuntimeHandle,
     runtime_handle_tool_catalog,
 )
-from ouroboros.orchestrator.coordinator import CoordinatorReview, LevelCoordinator
+from ouroboros.orchestrator.coordinator import (
+    CoordinatorReview,
+    LevelCoordinator,
+)
 from ouroboros.orchestrator.events import (
     create_ac_stall_detected_event,
     create_heartbeat_event,
@@ -75,15 +89,21 @@ from ouroboros.orchestrator.parallel_executor_models import (
 from ouroboros.orchestrator.runtime_message_projection import (
     project_runtime_message,
 )
+from ouroboros.orchestrator.worktree_path_resolver import (
+    build_resolver_for_ac,
+    normalize_files_modified,
+)
 
 if TYPE_CHECKING:
     from ouroboros.core.seed import Seed
     from ouroboros.mcp.types import MCPToolDefinition
     from ouroboros.orchestrator.adapter import AgentRuntime
     from ouroboros.orchestrator.dependency_analyzer import (
+        ACDependencySpec,
         DependencyGraph,
         StagedExecutionPlan,
     )
+    from ouroboros.orchestrator.file_overlap_predictor import FileOverlapPrediction
     from ouroboros.persistence.event_store import EventStore
 
 log = get_logger(__name__)
@@ -1296,6 +1316,214 @@ class ParallelACExecutor:
                 ordered_indices.append(ac_index)
         return tuple(ordered_indices)
 
+    def _resolve_repo_root_for_worktrees(self) -> str | None:
+        """Resolve the git repo root for per-AC worktree creation.
+
+        Returns None if the workspace is not inside a git repository,
+        in which case worktree isolation is silently skipped.
+        """
+        import os
+
+        cwd = self._task_cwd or self._adapter.working_directory
+        if not isinstance(cwd, str) or not cwd:
+            cwd = os.getcwd()
+        resolved = _try_resolve_repo_root(cwd)
+        return str(resolved) if resolved else None
+
+    def _resolve_repo_root(self) -> str | None:
+        """Resolve the repo root for file overlap prediction.
+
+        Delegates to the same logic used for worktree creation.
+        Returns None when the workspace is not a git repository.
+        """
+        return self._resolve_repo_root_for_worktrees()
+
+    @staticmethod
+    def _build_ac_dependency_specs(
+        seed: Seed,
+        ac_indices: list[int],
+    ) -> list[ACDependencySpec]:
+        """Build ACDependencySpec objects for file overlap prediction.
+
+        Extracts the AC content from the seed and builds minimal specs
+        suitable for the FileOverlapPredictor.
+
+        Args:
+            seed: Seed specification containing acceptance criteria.
+            ac_indices: AC indices to build specs for.
+
+        Returns:
+            List of ACDependencySpec for the specified ACs.
+        """
+        from ouroboros.orchestrator.dependency_analyzer import ACDependencySpec
+
+        specs: list[ACDependencySpec] = []
+        for idx in ac_indices:
+            if idx < len(seed.acceptance_criteria):
+                specs.append(
+                    ACDependencySpec(
+                        index=idx,
+                        content=seed.acceptance_criteria[idx],
+                    )
+                )
+        return specs
+
+    def _create_ac_worktree_manager(
+        self,
+        execution_id: str,
+    ) -> ACWorktreeManager | None:
+        """Create an ACWorktreeManager for this execution.
+
+        Returns None when the workspace is not a git repo (worktrees
+        are silently disabled in that case).
+        """
+        import os
+
+        repo_root = self._resolve_repo_root_for_worktrees()
+        if repo_root is None:
+            return None
+
+        source_cwd = self._task_cwd or self._adapter.working_directory
+        if not isinstance(source_cwd, str) or not source_cwd:
+            source_cwd = os.getcwd()
+
+        return ACWorktreeManager(
+            execution_id=execution_id,
+            repo_root=repo_root,
+            source_cwd=source_cwd,
+        )
+
+    async def _setup_ac_worktrees(
+        self,
+        worktree_manager: ACWorktreeManager,
+        worktree_ac_indices: tuple[int, ...],
+    ) -> dict[int, ACWorktreeInfo]:
+        """Create worktrees for ACs that need isolation.
+
+        Returns a mapping of ac_index → ACWorktreeInfo for successfully
+        created worktrees. ACs whose worktree creation fails are logged
+        and excluded (they will fall back to shared workspace).
+        """
+        worktree_map: dict[int, ACWorktreeInfo] = {}
+        for ac_idx in worktree_ac_indices:
+            try:
+                info = worktree_manager.create_ac_worktree(ac_idx)
+                worktree_map[ac_idx] = info
+                log.info(
+                    "parallel_executor.worktree.created",
+                    ac_index=ac_idx,
+                    branch=info.branch,
+                    worktree_path=info.worktree_path,
+                )
+            except WorktreeError as exc:
+                log.warning(
+                    "parallel_executor.worktree.create_failed",
+                    ac_index=ac_idx,
+                    error=str(exc),
+                )
+                self._console.print(
+                    f"  [yellow]Worktree creation failed for AC {ac_idx + 1}, "
+                    f"falling back to shared workspace[/yellow]"
+                )
+        return worktree_map
+
+    async def _commit_ac_worktree(
+        self,
+        worktree_manager: ACWorktreeManager,
+        ac_idx: int,
+        ac_content: str,
+    ) -> str | None:
+        """Commit all changes in an AC's worktree after execution.
+
+        Returns the commit SHA, or None if there was nothing to commit
+        or if the commit failed.
+        """
+        try:
+            message = f"AC {ac_idx + 1}: {ac_content[:72]}"
+            sha = worktree_manager.commit_ac_changes(ac_idx, message)
+            if sha:
+                log.info(
+                    "parallel_executor.worktree.committed",
+                    ac_index=ac_idx,
+                    sha=sha[:12],
+                )
+            return sha
+        except WorktreeError as exc:
+            log.warning(
+                "parallel_executor.worktree.commit_failed",
+                ac_index=ac_idx,
+                error=str(exc),
+            )
+            return None
+
+    def _normalize_level_context_paths(
+        self,
+        level_ctx: LevelContext,
+        *,
+        worktree_map: dict[int, ACWorktreeInfo],
+    ) -> LevelContext:
+        """Normalize worktree-absolute paths in level context to main-repo paths.
+
+        When ACs execute in worktrees, the tool call messages record absolute
+        file paths inside the worktree directory (e.g.
+        ``~/.ouroboros/worktrees/proj/orch_abc_ac_1/src/foo.py``). Downstream
+        consumers — next-level prompts, conflict detection, merge operations —
+        expect main-repo paths for consistent file identity.
+
+        For ACs that ran in SHARED mode, their paths are already correct and
+        are returned unchanged.
+
+        Args:
+            level_ctx: Extracted level context with raw tool-call paths.
+            worktree_map: Mapping of ac_index → ACWorktreeInfo for ACs that
+                ran in worktrees during this level.
+
+        Returns:
+            New LevelContext with normalized ``files_modified`` paths.
+        """
+        if not worktree_map:
+            return level_ctx
+
+        import os
+
+        repo_root = self._task_cwd or self._adapter.working_directory or os.getcwd()
+        from ouroboros.orchestrator.level_context import ACContextSummary
+
+        normalized_acs: list[ACContextSummary] = []
+        for ac_summary in level_ctx.completed_acs:
+            wt_info = worktree_map.get(ac_summary.ac_index)
+            if wt_info is None or not ac_summary.files_modified:
+                # SHARED AC or no files modified — keep as-is
+                normalized_acs.append(ac_summary)
+                continue
+
+            # Build a resolver for this AC's worktree
+            resolver = build_resolver_for_ac(
+                repo_root=repo_root,
+                worktree_info=wt_info,
+                isolation_mode="worktree",
+            )
+            normalized_files = normalize_files_modified(
+                ac_summary.files_modified,
+                resolver,
+            )
+            normalized_acs.append(
+                ACContextSummary(
+                    ac_index=ac_summary.ac_index,
+                    ac_content=ac_summary.ac_content,
+                    success=ac_summary.success,
+                    tools_used=ac_summary.tools_used,
+                    files_modified=normalized_files,
+                    key_output=ac_summary.key_output,
+                )
+            )
+
+        return LevelContext(
+            level_number=level_ctx.level_number,
+            completed_acs=tuple(normalized_acs),
+            coordinator_review=level_ctx.coordinator_review,
+        )
+
     async def _execute_ac_batch(
         self,
         *,
@@ -1309,14 +1537,69 @@ class ParallelACExecutor:
         level_contexts: list[LevelContext],
         ac_retry_attempts: dict[int, int],
         execution_counters: dict[str, int] | None = None,
-    ) -> list[ACExecutionResult | BaseException]:
-        """Execute one batch of stage-ready ACs using the shared worker pool."""
+        isolation_plan: ACIsolationPlan | None = None,
+    ) -> tuple[list[ACExecutionResult | BaseException], dict[int, ACWorktreeInfo]]:
+        """Execute one batch of stage-ready ACs using the shared worker pool.
+
+        Returns a tuple of (results, worktree_map) where worktree_map contains
+        the AC worktree info for ACs that ran in worktree isolation. The map
+        is empty when all ACs run in shared mode.
+
+        When ``isolation_plan`` is None or all ACs are SHARED, this follows the
+        existing execution path with zero additional overhead.  Only ACs whose
+        isolation mode is WORKTREE get worktree setup/teardown.
+
+        Worktree lifecycle:
+        1. Before dispatch: create worktrees for WORKTREE ACs.
+        2. During execution: WORKTREE ACs execute with effective_cwd pointing
+           to their isolated worktree directory.
+        3. After execution: commit changes in each worktree so they can be
+           merged back by the merge-agent in a later step.
+        """
         batch_results: list[ACExecutionResult | BaseException] = [None] * len(batch_indices)
         sibling_acs = (
             [seed.acceptance_criteria[i] for i in batch_indices] if len(batch_indices) > 1 else []
         )
 
+        # Resolve the effective isolation plan.  When None or all-shared,
+        # every AC follows the existing code path with zero overhead —
+        # no worktree checks, no isolation_mode kwarg, nothing extra.
+        effective_plan = isolation_plan
+
+        # --- Worktree setup phase ---
+        # Only create worktrees when the plan requires them. For the common
+        # case (no file overlap), this entire block is skipped.
+        worktree_manager: ACWorktreeManager | None = None
+        worktree_map: dict[int, ACWorktreeInfo] = {}
+
+        if effective_plan is not None and effective_plan.has_worktrees:
+            worktree_manager = self._create_ac_worktree_manager(execution_id)
+            if worktree_manager is not None:
+                worktree_map = await self._setup_ac_worktrees(
+                    worktree_manager,
+                    effective_plan.worktree_indices,
+                )
+                if worktree_map:
+                    self._console.print(
+                        f"  [cyan]Created {len(worktree_map)} worktree(s) for "
+                        f"isolated AC execution[/cyan]"
+                    )
+                    self._flush_console()
+
         async def _run_ac(idx: int, ac_idx: int) -> None:
+            # Determine isolation mode for this AC.
+            # For SHARED (the common case / no overlap), the existing
+            # execution path is used as-is with no additional overhead.
+            ac_isolation_mode = IsolationMode.SHARED
+            ac_worktree_info: ACWorktreeInfo | None = None
+            if effective_plan is not None and needs_worktree(effective_plan, ac_idx):
+                ac_worktree_info = worktree_map.get(ac_idx)
+                if ac_worktree_info is not None:
+                    ac_isolation_mode = IsolationMode.WORKTREE
+                else:
+                    # Worktree creation failed — fall back to shared workspace
+                    ac_isolation_mode = IsolationMode.SHARED
+
             async with self._semaphore:
                 try:
                     batch_results[idx] = await self._execute_single_ac(
@@ -1333,6 +1616,8 @@ class ParallelACExecutor:
                         sibling_acs=sibling_acs,
                         retry_attempt=ac_retry_attempts[ac_idx],
                         execution_counters=execution_counters,
+                        isolation_mode=ac_isolation_mode,
+                        worktree_info=ac_worktree_info,
                     )
                 except BaseException as e:
                     # Never suppress anyio Cancelled — doing so breaks
@@ -1346,7 +1631,22 @@ class ParallelACExecutor:
             for idx, ac_idx in enumerate(batch_indices):
                 tg.start_soon(_run_ac, idx, ac_idx)
 
-        return batch_results
+        # --- Worktree commit phase ---
+        # After all ACs in the batch complete, commit changes in each worktree
+        # so the merge-agent can merge them back into the main workspace.
+        if worktree_manager is not None and worktree_map:
+            for ac_idx, _wt_info in worktree_map.items():
+                result = batch_results[batch_indices.index(ac_idx)] if ac_idx in batch_indices else None
+                # Only commit if the AC succeeded — failed AC worktrees
+                # are cleaned up without committing.
+                if isinstance(result, ACExecutionResult) and result.success:
+                    await self._commit_ac_worktree(
+                        worktree_manager,
+                        ac_idx,
+                        seed.acceptance_criteria[ac_idx],
+                    )
+
+        return batch_results, worktree_map
 
     async def execute_parallel(
         self,
@@ -1619,6 +1919,46 @@ class ParallelACExecutor:
                     )
                     continue
 
+                # --- Pre-execution prediction phase ---
+                # Run the file overlap prediction engine to determine which
+                # ACs may touch the same files. The prediction result drives
+                # isolation decisions: overlapping ACs get worktree isolation,
+                # non-overlapping ACs stay in the shared workspace (zero overhead).
+                #
+                # For single-AC stages or when prediction returns no overlaps
+                # (the common case), all ACs get IsolationMode.SHARED and follow
+                # the existing execution path with zero additional overhead.
+                level_prediction: FileOverlapPrediction | None = None
+                if len(executable) > 1:
+                    ac_specs = self._build_ac_dependency_specs(seed, executable)
+                    repo_root = self._resolve_repo_root()
+                    level_prediction = await self._coordinator.run_pre_execution_prediction(
+                        ac_specs,
+                        seed=seed,
+                        stage_ac_indices=tuple(executable),
+                        repo_root=repo_root,
+                    )
+
+                file_overlap_groups: list[list[int]] | None = None
+                if level_prediction is not None and level_prediction.has_overlaps:
+                    file_overlap_groups = [
+                        list(group.ac_indices)
+                        for group in level_prediction.overlap_groups
+                    ]
+
+                isolation_plan = classify_isolation_modes(
+                    ac_indices=executable,
+                    file_overlap_groups=file_overlap_groups,
+                )
+                if isolation_plan.has_worktrees:
+                    log.info(
+                        "parallel_executor.isolation.worktrees_required",
+                        level=level_num,
+                        shared=isolation_plan.shared_indices,
+                        worktree=isolation_plan.worktree_indices,
+                        prediction_driven=True,
+                    )
+
                 # Mark ACs as executing
                 for ac_idx in executable:
                     ac_statuses[ac_idx] = "executing"
@@ -1643,6 +1983,7 @@ class ParallelACExecutor:
                 # Process results
                 level_success = 0
                 level_failed = 0
+                stage_worktree_map: dict[int, ACWorktreeInfo] = {}
 
                 for batch_index, batch in enumerate(stage_batches, start=1):
                     batch_executable = [ac_idx for ac_idx in batch if ac_idx in executable]
@@ -1674,7 +2015,7 @@ class ParallelACExecutor:
                         tool_calls_count=execution_counters["tool_calls_count"],
                     )
 
-                    batch_results = await self._execute_ac_batch(
+                    batch_results, batch_worktree_map = await self._execute_ac_batch(
                         seed=seed,
                         batch_indices=batch_executable,
                         session_id=session_id,
@@ -1685,7 +2026,11 @@ class ParallelACExecutor:
                         level_contexts=current_contexts,
                         ac_retry_attempts=ac_retry_attempts,
                         execution_counters=execution_counters,
+                        isolation_plan=isolation_plan,
                     )
+                    # Accumulate worktree info across batches for path
+                    # normalization when building level context.
+                    stage_worktree_map.update(batch_worktree_map)
 
                     for ac_idx, result in zip(batch_executable, batch_results, strict=False):
                         if isinstance(result, BaseException):
@@ -1808,9 +2153,50 @@ class ParallelACExecutor:
                     ]
                     level_ctx = extract_level_context(level_ac_data, level_num)
 
+                    # Normalize worktree paths back to main-repo paths.
+                    # When ACs ran in worktrees, tool call messages record
+                    # worktree-absolute paths. Downstream consumers expect
+                    # main-repo paths for consistent file identity.
+                    if isolation_plan.has_worktrees and stage_worktree_map:
+                        level_ctx = self._normalize_level_context_paths(
+                            level_ctx,
+                            worktree_map=stage_worktree_map,
+                        )
+
                     # Coordinator: detect and resolve file conflicts (Approach A)
+                    # This is the safety net fallback — it runs regardless of
+                    # whether prediction was active, catching any conflicts that
+                    # prediction missed or that arose despite isolation.
                     level_ac_results = [r for r in stage_ac_results if r.ac_index in executable]
                     conflicts = self._coordinator.detect_file_conflicts(level_ac_results)
+
+                    # Build prediction accuracy metrics comparing pre-execution
+                    # prediction against post-hoc conflict detection.
+                    prediction_metrics = LevelCoordinator.build_prediction_metrics(
+                        level_number=level_num,
+                        prediction=level_prediction,
+                        conflicts=conflicts,
+                        isolation_was_applied=isolation_plan.has_worktrees,
+                    )
+                    if prediction_metrics.safety_net_fired:
+                        log.warning(
+                            "parallel_executor.safety_net.fired",
+                            level=level_num,
+                            missed_count=len(prediction_metrics.missed_conflicts),
+                            missed_files=sorted(prediction_metrics.missed_conflicts),
+                            prediction_was_active=prediction_metrics.prediction_was_active,
+                        )
+                        self._console.print(
+                            f"  [yellow]Safety net: {len(prediction_metrics.missed_conflicts)} "
+                            f"conflict(s) not covered by prediction[/yellow]"
+                        )
+                    elif conflicts and prediction_metrics.prediction_was_active:
+                        log.info(
+                            "parallel_executor.prediction.covered_all_conflicts",
+                            level=level_num,
+                            conflict_count=len(conflicts),
+                            isolation_was_applied=prediction_metrics.isolation_was_applied,
+                        )
 
                     if conflicts:
                         self._console.print(
@@ -1957,6 +2343,8 @@ class ParallelACExecutor:
         sibling_acs: list[str] | None = None,
         retry_attempt: int = 0,
         execution_counters: dict[str, int] | None = None,
+        isolation_mode: IsolationMode = IsolationMode.SHARED,
+        worktree_info: ACWorktreeInfo | None = None,
     ) -> ACExecutionResult:
         """Execute a single AC, decomposing into parallel Sub-ACs if complex.
 
@@ -1976,6 +2364,7 @@ class ParallelACExecutor:
             execution_id: Execution ID for event tracking.
             level_contexts: Context from previously completed levels.
             sibling_acs: Descriptions of ACs running in parallel at this level.
+            worktree_info: Worktree metadata when isolation_mode is WORKTREE.
 
         Returns:
             ACExecutionResult for this AC.
@@ -2077,7 +2466,10 @@ class ParallelACExecutor:
                     depth=depth,
                 )
 
-        # Execute atomic AC directly
+        # Execute atomic AC directly.
+        # For SHARED isolation (no overlap), this follows the existing path
+        # with zero additional overhead.  WORKTREE isolation is handled
+        # inside _execute_atomic_ac when isolation_mode == WORKTREE.
         return await self._execute_atomic_ac(
             ac_index=ac_index,
             ac_content=ac_content,
@@ -2093,6 +2485,8 @@ class ParallelACExecutor:
             sibling_acs=sibling_acs,
             retry_attempt=retry_attempt,
             execution_counters=execution_counters,
+            isolation_mode=isolation_mode,
+            worktree_info=worktree_info,
         )
 
     async def _try_decompose_ac(
@@ -2654,8 +3048,19 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
         retry_attempt: int = 0,
         tool_catalog: tuple[MCPToolDefinition, ...] | None = None,
         execution_counters: dict[str, int] | None = None,
+        isolation_mode: IsolationMode = IsolationMode.SHARED,
+        worktree_info: ACWorktreeInfo | None = None,
     ) -> ACExecutionResult:
         """Execute an atomic AC directly via Claude Agent.
+
+        When ``isolation_mode`` is SHARED (the default / no-overlap case),
+        this method follows the existing execution path identically — the
+        parameter is simply ignored and no worktree overhead is incurred.
+
+        When ``isolation_mode`` is WORKTREE, the AC runs in a dedicated git
+        worktree. The ``worktree_info`` provides the effective_cwd that
+        replaces the shared workspace directory in the agent's prompt, so
+        all file operations target the isolated worktree.
 
         Returns:
             ACExecutionResult for this AC.
@@ -2697,9 +3102,31 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
                 )
 
         # Scan the requested runtime workspace so prompts stay aligned with the actual task cwd.
+        # When the AC runs in a worktree, use the worktree's effective_cwd so
+        # all file operations target the isolated directory. For SHARED mode
+        # (the common case), this is identical to the existing behaviour.
         import os
 
-        cwd = self._task_cwd or self._adapter.working_directory
+        # Path resolution for worktree ACs:
+        # - CWD is set to worktree_info.effective_cwd (below) so all agent
+        #   file operations target the isolated worktree directory.
+        # - After execution, _normalize_level_context_paths() translates
+        #   worktree-absolute paths back to main-repo paths for downstream
+        #   consumers (context passing, conflict detection, merge).
+
+        if (
+            isolation_mode == IsolationMode.WORKTREE
+            and worktree_info is not None
+        ):
+            cwd = worktree_info.effective_cwd
+            log.info(
+                "parallel_executor.ac.worktree_cwd",
+                ac_index=ac_index,
+                effective_cwd=cwd,
+                branch=worktree_info.branch,
+            )
+        else:
+            cwd = self._task_cwd or self._adapter.working_directory
         if not isinstance(cwd, str) or not cwd:
             cwd = os.getcwd()
         try:
@@ -2707,6 +3134,18 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
             file_listing = "\n".join(f"- {e}" for e in entries if not e.startswith("."))
         except OSError:
             file_listing = "(unable to list)"
+
+        # Build isolation notice for worktree ACs so the agent knows it's
+        # operating in an isolated copy and should not worry about conflicts.
+        isolation_section = ""
+        if isolation_mode == IsolationMode.WORKTREE and worktree_info is not None:
+            isolation_section = (
+                "\n## Isolation Notice\n"
+                "You are running in an isolated git worktree. All file changes you make "
+                "will be automatically committed and merged back after completion. "
+                "You have exclusive access to this workspace — no other agents are "
+                "modifying these files concurrently.\n"
+            )
 
         prompt = f"""Execute the following task:
 
@@ -2723,7 +3162,7 @@ Files present:
 
 ## Your Task ({label})
 {ac_content}
-{context_section}{retry_section}{parallel_section}
+{context_section}{retry_section}{parallel_section}{isolation_section}
 Use the available tools to accomplish this task. Report your progress clearly.
 When complete, explicitly state: [TASK_COMPLETE]
 """
